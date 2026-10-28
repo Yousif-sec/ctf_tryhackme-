@@ -280,7 +280,7 @@ In Linux, directory write permission allows a user to delete and recreate files 
 
 ### Exploitation Path
 
-The attacker cannot simply modify the original `backup.inc.php` file in place. Instead, they can delete it or move it, then create a new file with the exact same name containing a malicious payload.
+The attacker cannot simply modify the original `backup.inc.php` file in place. Instead, they can delete it or move it, then create a new file with the exact same name, `lib/backup.inc.php`, containing a custom malicious PHP payload.
 
 ```bash
 rm -f lib/backup.inc.php
