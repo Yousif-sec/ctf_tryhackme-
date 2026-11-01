@@ -40,6 +40,7 @@ Not shown: 998 closed tcp ports (reset)
 PORT     STATE SERVICE VERSION
 22/tcp   open  ssh     OpenSSH 8.2p1 Ubuntu 4ubuntu0.11 (Ubuntu Linux; protocol 2.0)
 8000/tcp open  http    Werkzeug httpd 3.0.2 (Python 3.8.10)
+6048/tcp open x11?
 Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel
 ```
 
