@@ -67,7 +67,7 @@ This returned a valid user list:
 ```text
 gnome-initial-setup:x:125:65534::/run/gnome-initial-setup/:/bin/false
 gdm:x:126:131:Gnome Display Manager:/var/lib/gdm3:/bin/false
-sssd:x:127:132:SSSD system user,,,:/var/lib/sss:/usr/sbin/nologin
+sssd:x:127,132:SSSD system user,,,:/var/lib/sss:/usr/sbin/nologin
 carlos:x:1000:1000:carlos,,,:/home/carlos:/bin/bash
 systemd-coredump:x:999:999:systemd Core Dumper:/:/usr/sbin/nologin
 hudson:x:1001:1001::/home/hudson:/bin/bash
@@ -108,6 +108,15 @@ I also checked:
 
 This returned environment data, but it was not useful for exploitation. The key finding was that the LFI primitive was valid and that the app was likely exposing more sensitive system data through other paths.
 
+I also ruled out the usual PHP-based attack paths:
+
+```text
+I don't have phpinfo() for session poisoning.
+Also, PHP wrappers are disabled because allow_url_include=off, so there is no straightforward way to get RCE via wrappers.
+```
+
+This was an important note, because it eliminated the common file-wrapper and session-poisoning routes and forced the investigation toward `/proc` and hidden services instead.
+
 > This was an important reminder that a working LFI primitive does not necessarily mean the obvious files are readable. The trick was to keep enumerating the system and the running process environment.
 
 ---
@@ -144,6 +153,7 @@ Relevant results:
 /var/log/dpkg.log       [Status: 200, Size: 3005, Words: 168, Lines: 36, Duration: 268ms]
 /var/log/wtmp           [Status: 200, Size: 15744, Words: 10, Lines: 2, Duration: 144ms]
 /var/log/dmesg          [Status: 200, Size: 43848, Words: 6686, Lines: 586, Duration: 165ms]
+/proc/net/tcp           [Status: 200, Size: 85800, Words: 34605, Lines: 573, Duration: 147ms]
 ```
 
 This proved the LFI primitive was broad enough to read many system resources. The next step was to read process metadata and the running app source.
@@ -517,6 +527,17 @@ The service on port 6048 was not obvious from the original scan because the Nmap
 
 The `gdbserver` exploit script was a public PoC and not perfectly deterministic. Some environment differences caused inconsistent behavior, but the exploit still succeeded and provided the foothold that led to privilege escalation.
 
+### Dead end 6: PHP wrappers and session poisoning were ruled out
+
+I checked for PHP-based attack routes, but they were not viable in this challenge:
+
+```text
+I don't have phpinfo() for session poisoning.
+Also, PHP wrappers are disabled because allow_url_include=off, so there is no straightforward way to get RCE via wrappers.
+```
+
+This was important because it eliminated a common web application exploitation path, preventing time from being wasted on a dead end.
+
 ---
 
 ## 12. Final Attack Chain Summary
@@ -570,4 +591,3 @@ cat /root/root.txt
 ![Web application placeholder](https://via.placeholder.com/800x250?text=Airplane+Web+Application)
 
 ![Exploit flow placeholder](https://via.placeholder.com/800x250?text=Privilege+Escalation+Flow)
-
