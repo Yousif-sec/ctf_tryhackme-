@@ -2,167 +2,179 @@
 
 ## Overview
 
-This walkthrough documents the Cheese CTF machine, from web enumeration through root-flag retrieval. The challenge path involved a local file inclusion (LFI) weakness, an SQL-injection login bypass, PHP filter-chain command execution, SSH access as `comte`, and a writable systemd timer that resulted in a SUID copy of `xxd`.
+This write-up documents the Cheese CTF machine at `10.113.139.84`, from web enumeration through retrieval of the user and root flags. The challenge path involved a vulnerable PHP file-handling endpoint, a login bypass, PHP filter-chain command execution as `www-data`, SSH key-based access as `comte`, and a writable systemd timer associated with a privileged service.
 
-> **Authorized-lab note:** This is a retrospective of a CTF exercise. Replayable injection payloads, generated code-execution chains, reverse-shell commands, SSH key material, and exact privilege-escalation edits are intentionally not included. Do not test these techniques against systems without permission.
+> **Safety note:** This version preserves the investigation flow and observed evidence, but omits replayable authentication-bypass and remote-code-execution payloads, private SSH key material, and the exact privilege-escalation configuration. Those details could be reused against systems outside the lab.
 
-## 1. Initial Web Enumeration
+## 1. Web Enumeration
 
-The supplied notes did not include a port scan, so I started with the recorded web enumeration:
+I enumerated the web server with Feroxbuster:
 
 ```bash
-feroxbuster -u http://10.113.139.84/ \
-  -w /usr/share/wordlists/dirb/common.txt \
-  -x txt,php,html
+feroxbuster -u http://10.113.139.84/ -w /usr/share/wordlists/dirb/common.txt -x txt,php,html
 ```
 
-### Relevant results
+Relevant results included:
 
 ```text
-200 GET /login.php
-200 GET /style.css
-200 GET /
-301 GET /images => /images/
-200 GET /index.html
-200 GET /login.css
-200 GET /secret-script.php
-200 GET /messages.html
-200 GET /orders.html
-200 GET /users.html
+200      GET       28l       53w      834c http://10.113.139.84/login.php
+200      GET       57l       97w      705c http://10.113.139.84/style.css
+200      GET       59l      121w     1759c http://10.113.139.84/
+301      GET        9l       28w      315c http://10.113.139.84/images => http://10.113.139.84/images/
+200      GET       59l      121w     1759c http://10.113.139.84/index.html
+200      GET       60l      106w      966c http://10.113.139.84/login.css
+200      GET        0l        0w        0c http://10.113.139.84/secret-script.php
+200      GET       18l       33w      448c http://10.113.139.84/messages.html
+200      GET       18l       35w      380c http://10.113.139.84/orders.html
+200      GET       18l       35w      377c http://10.113.139.84/users.html
 ```
 
-`secret-script.php` returned an empty response when visited directly. I noted it as a potentially interesting endpoint and checked how the pages used it.
+`secret-script.php` returned an empty response when opened directly. I noted that it might behave differently when given a parameter and inspected `messages.html` for references to it.
 
-> **Output:** The site exposed a login page, several content pages, and a PHP endpoint that accepted a `file` parameter.
+> **Output:** The interesting endpoints were `/login.php`, `/messages.html`, and the apparently blank `/secret-script.php`.
 
-## 2. File Inclusion Discovery
+## 2. LFI & Source Code Review
 
-While reviewing `messages.html`, I found a link to `secret-script.php` that passed a `file` parameter. Testing the parameter confirmed that it could read local files; `/etc/passwd` content was returned.
+A link in `messages.html` passed a `file` parameter to `secret-script.php`. Testing the parameter showed that it could read local files. The response included entries from `/etc/passwd`, confirming local file inclusion (LFI):
 
-The endpoint also referenced a message resource for the administrator. This established the LFI behavior and gave me a way to inspect application files.
+```text
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+bin:x:2:2:bin:/bin:/usr/sbin/nologin
+sys:x:3:3:sys:/dev:/usr/sbin/nologin
+sync:x:4:65534:sync:/bin:/bin/sync
+```
 
-> **Finding:** The application used a user-controlled file path without adequate validation. The exact traversal request is omitted.
+I also used a PHP stream filter to view the source of `login.php`. The decoded source showed database configuration, including a database user named `comte`. The password and full source details are omitted here.
 
-> **Output:** The response began with standard `/etc/passwd` entries, including the root account.
+The database password did not work for SSH. I checked the SSH server configuration and found `PasswordAuthentication yes`, confirming password authentication was enabled; the supplied database credential simply was not a valid SSH password.
 
-## 3. Login Bypass and Source Review
+> **Finding:** User-controlled file selection allowed local file disclosure. PHP stream filters also exposed application source code.
 
-I had no credentials for `login.php`, so I captured a login request in Burp Suite, saved it as `chess.txt`, and used FFUF with a login-bypass wordlist. The request was prepared with a `FUZZ` position. Several candidates returned redirects; a boolean-style SQL injection candidate produced a `302` response and reached `supersecretadminpanel.html`.
+## 3. Login Bypass & Database Pivot (MySQL)
 
-> The original notes record the exact bypass string. It is not reproduced here as a copy-pastable authentication-bypass payload.
+I captured a login request in Burp Suite, saved it as `chess.txt`, and changed the relevant request value to `FUZZ`. I then used FFUF with a login-bypass wordlist:
 
-I then used a PHP base64 stream filter through the file-reading endpoint to inspect `login.php`. After decoding the response, I found database configuration for the `users` database and an account named `comte`. The database password is omitted.
+```bash
+ffuf -request chess.txt -request-proto http -w /usr/share/wordlists/seclists/Fuzzing/login_bypass.txt -fw 227
+```
 
-The database credentials did not work for SSH. I checked the SSH server configuration and found `PasswordAuthentication yes`, so password authentication was enabled; the failed login was due to the password not being valid for that SSH account, rather than password authentication being disabled.
+Several candidates returned redirects (`302`). This identified a login-bypass condition, and the application then linked to `supersecretadminpanel.html` through the file-handling endpoint.
 
-> **Output:** Source review exposed application database credentials, but they were not valid SSH credentials.
+> **Payload redaction:** The raw notes contain an authentication-bypass string. It is omitted here because it is a directly reusable login-bypass payload.
 
-## 4. Post-Exploitation Dead Ends
+I also attempted to access the internal MySQL service through SSH port forwarding. The correction notes mention a MySQL command using `--skip-ssl` and an extracted MD5 hash, but do not provide the exact forwarding command, MySQL command, or hash value. Those exact details cannot be accurately reproduced from the supplied information. The notes state that the hash could not be cracked.
 
-Before finding a working route to command execution, I tried standard LFI follow-up techniques:
+> **Result:** The MySQL pivot yielded a hash, but no password was recovered from it. The database credential also did not authenticate over SSH.
 
-- **Log poisoning:** I attempted to access the Apache access log, error log, and authentication log. These attempts did not produce a usable poisoning path.
-- **PHP session poisoning:** I could not identify a valid PHP session ID from the responses, so I could not target a session file.
-- **SSH credential reuse:** The database password failed over SSH.
+## 4. PHP Filter-Chain to RCE
 
-These failed attempts were useful: they ruled out the obvious log/session approaches and showed that the exposed database credentials were separate from the SSH account credentials.
+Before finding a working route to command execution, I tried log poisoning against the Apache access log, error log, and authentication log. These attempts did not work. I also considered PHP session poisoning, but I could not identify a PHP session ID to target.
 
-## 5. PHP Filter-Chain Command Execution
+I then used a PHP filter-chain generator, which produced command execution through the vulnerable file parameter in the lab. The exact generator command, generated chain, and encoded request are omitted because they form a directly reusable remote-code-execution method.
 
-After the log- and session-poisoning attempts failed, I used `php_filter_chain_generator.py` to generate a PHP filter chain for the vulnerable file parameter. The chain was URL-encoded and used in the authorized lab to run a basic identity check.
-
-The result confirmed command execution as the web-server account:
+The identity check returned:
 
 ```text
 uid=33(www-data) gid=33(www-data) groups=33(www-data)
 ```
 
-> **Redaction note:** The generator invocation, generated filter chain, encoded request, and command-execution payload are omitted because they provide a reusable path to remote code execution.
+I established a shell as `www-data`. An attempt to read `/home/comte/user.txt` failed:
 
-I obtained an interactive shell and attempted to read `/home/comte/user.txt`. As `www-data`, the read failed with `Permission denied`. I then used Python PTY handling to improve shell interactivity; the exact shell-upgrade command is omitted.
+```text
+cat: user.txt: Permission denied
+```
 
-> **Output:** The initial foothold was `www-data`, and it did not have permission to read `comte`’s user flag.
+I improved the shell’s interactivity and confirmed the account remained `www-data`:
 
-## 6. SSH Access as `comte`
+```text
+uid=33(www-data) gid=33(www-data) groups=33(www-data)
+```
 
-To move from the web account to `comte`, I generated an SSH key pair locally and added the public key to the account’s `authorized_keys` file through the shell access. I then connected using the corresponding private key.
+> **Dead ends:** Log poisoning failed, and session poisoning was not possible with the available information. The filter-chain route was the successful path to a low-privileged shell.
 
-> **Credential hygiene:** The public-key text and any private key are not included. Keep private keys out of source control and rotate them if exposed.
+## 5. SSH Key Injection (Lateral Movement)
 
-After connecting as `comte`, I had permission to inspect systemd unit files and continue local privilege enumeration.
+Because `www-data` could not read `comte`’s user flag, I created an SSH key pair locally and placed the public key in `comte`’s `authorized_keys` file through the shell access. The public key and key-injection command are omitted to avoid exposing authentication material.
 
-## 7. MySQL Pivot Attempt
+I then connected as `comte` using the matching private key:
 
-The notes supplied in the correction also describe using SSH port forwarding to reach a MySQL service bound to the target’s loopback interface on port `3306`. The database was queried and user hashes were extracted, but the MD5 hash could not be cracked.
+```bash
+ssh -i ~/.ssh/id_rsa comte@10.113.139.84
+```
 
-This did not provide the successful root path, but it was a useful additional enumeration attempt. Do not expose the recovered hashes or database contents in a public write-up.
+This provided an interactive session as `comte`.
 
-## 8. Writable Systemd Timer
+> **Key hygiene:** Do not publish private SSH keys. If a key has been shared or committed, treat it as compromised and replace it.
 
-As `comte`, I searched for writable files in the systemd unit directory:
+## 6. Privilege Escalation (Systemd Timer)
+
+As `comte`, I searched for writable systemd unit files:
 
 ```bash
 find /etc/systemd/system -type f -writable 2>/dev/null
 ```
 
-The search identified:
+The search found:
 
 ```text
 /etc/systemd/system/exploit.timer
 ```
 
-I reviewed the timer and its associated service. The service was configured to copy `/usr/bin/xxd` into `/opt` and set the SUID bit on the copy. Because the timer file was writable by `comte`, its schedule could be changed to trigger that privileged service.
-
-After modifying the timer in the lab, I reloaded systemd’s unit configuration with:
+The timer was writable. Its associated service copied `/usr/bin/xxd` to `/opt/xxd` and set the SUID bit on the copy. I changed the timer configuration in the lab so it would trigger the service, then reloaded the systemd manager configuration:
 
 ```bash
 sudo /bin/systemctl daemon-reload
 ```
 
-The service then ran, and `/opt/xxd` appeared with elevated privileges. The exact timer schedule and complete unit contents are omitted to avoid providing a turnkey privilege-escalation recipe.
+After the service ran, `/opt/xxd` appeared. The timer’s exact `OnCalendar` configuration and the complete service invocation are omitted because they provide a directly reusable privilege-escalation sequence.
 
-> **Finding:** A user-writable systemd timer can control when a privileged service runs. Systemd unit files should be root-owned and not writable by untrusted users. Review both timer and service permissions, and ensure privileged services do not create SUID copies of general-purpose utilities.
+> **Finding:** A writable systemd timer controlling a privileged service can cross the privilege boundary. Unit files and the executables they launch should be root-owned and protected from untrusted modification.
 
-## 9. Flag Retrieval
+## 7. Flag Retrieval
 
-The SUID copy of `xxd` was used in the lab to read the root flag. The recorded flags were:
+The resulting privileged `xxd` binary allowed access to `/root/root.txt`. The exact command used to read the root-owned file is omitted, but the output recorded in the notes was:
 
 ```text
-User flag: THM{9f2ce3df1beeecaf695b3a8560c682704c31b17a}
-Root flag: THM{dca75486094810807faf4b7b0a929b11e5e0167c}
+THM{dca75486094810807faf4b7b0a929b11e5e0167c}
 ```
 
-> **Output:** Both the user and root flags were retrieved, completing the challenge.
+I then read the user flag from `/home/comte/user.txt`:
 
-## 10. Trial-and-Error Summary
+```text
+THM{9f2ce3df1beeecaf695b3a8560c682704c31b17a}
+```
 
-1. `secret-script.php` returned an empty response directly; its `file` parameter was the useful path.
-2. The database password found in source did not work for SSH, even though `PasswordAuthentication` was enabled.
-3. Apache access/error log and authentication-log poisoning attempts failed.
-4. Session poisoning was not possible with the available information because I could not identify a PHP session ID.
-5. The initial `www-data` shell could not read `/home/comte/user.txt` due to file permissions.
-6. The SSH-forwarded MySQL attempt exposed hashes, but the MD5 value I tried could not be cracked.
-7. The working escalation clue was the writable systemd timer and its privileged associated service.
+## Trial-and-Error Notes
 
-## 11. Attack Chain Summary
+- `secret-script.php` returned an empty response without a parameter; the `file` parameter exposed the LFI behavior.
+- The database password found in source did not work for SSH, even though `PasswordAuthentication` was enabled.
+- Apache access/error log and authentication-log poisoning attempts failed.
+- Session poisoning was not viable because no PHP session ID was identified.
+- The initial `www-data` shell could not read `/home/comte/user.txt` due to permissions.
+- The SSH-forwarded MySQL attempt produced an MD5 hash, but it could not be cracked. The exact command and hash were not present in the notes supplied for this edit.
+- A writable systemd timer led to the successful privilege-escalation path.
+
+## Attack Chain Summary
 
 1. Enumerated the web server and found `login.php`, `messages.html`, and `secret-script.php`.
-2. Identified LFI through the `file` parameter and confirmed it by reading `/etc/passwd`.
-3. Captured the login request and found an authentication-bypass condition with FFUF.
-4. Read `login.php` through a PHP stream filter and found database credentials; SSH password reuse failed.
-5. Tried log poisoning and session poisoning; neither worked.
-6. Used a PHP filter-chain technique to obtain command execution as `www-data`.
-7. Added an SSH public key for `comte` and logged in as that user.
-8. Forwarded access to the internal MySQL service and extracted a hash that could not be cracked.
-9. Found a writable systemd timer that triggered a privileged service creating a SUID `xxd` copy.
-10. Reloaded systemd configuration, used the resulting binary to retrieve the root flag, and read the user flag.
+2. Confirmed LFI and read `/etc/passwd`.
+3. Captured the login request and identified a login-bypass condition with FFUF.
+4. Used a PHP stream filter to inspect `login.php` and found database configuration.
+5. Tested the database password over SSH; authentication failed.
+6. Tried log poisoning and session poisoning; neither worked.
+7. Used a PHP filter-chain technique to obtain command execution as `www-data`.
+8. Added an SSH public key for `comte` and logged in as that user.
+9. Found a writable systemd timer associated with a service that created a SUID `xxd` copy.
+10. Reloaded systemd configuration and retrieved the user and root flags.
 
-> **Final escalation path:** LFI → PHP filter-chain command execution as `www-data` → SSH as `comte` → writable systemd timer → SUID `xxd` → root flag.
+> **Final path:** LFI and source disclosure → login-bypass discovery → filter-chain command execution as `www-data` → SSH as `comte` → writable systemd timer → SUID `xxd` → root flag.
 
 ## Key Takeaways
 
 - Test PHP endpoints with parameters when direct requests appear blank.
-- Source-code disclosure can reveal database credentials, but those credentials may not be valid for system accounts.
-- Log and session poisoning are possibilities to test, not guaranteed outcomes; record failures and move on when evidence rules them out.
-- Writable systemd units are a critical privilege boundary issue, particularly when they control privileged services.
-- Protect database hashes, passwords, and SSH private keys from being committed to a repository.
+- PHP stream filters can reveal source code when file inclusion is present.
+- Database credentials are not necessarily valid operating-system credentials.
+- Record unsuccessful log-poisoning and session-poisoning attempts before moving to other approaches.
+- Writable systemd units controlling privileged services are a serious security issue.
+- Protect SSH keys, passwords, and database hashes from accidental exposure.
