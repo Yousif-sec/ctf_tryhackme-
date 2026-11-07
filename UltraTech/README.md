@@ -1,131 +1,314 @@
-# UltraTech — CTF Walkthrough
+# UltraTech CTF Challenge Write-Up
 
-> **Scope and safety:** This write-up documents an authorized, isolated CTF lab. Run security testing only against systems you own or have explicit permission to assess. Host-specific exploit payloads, recovered passwords, and private-key material are intentionally redacted; they are secrets, not suitable for a repository write-up.
+## Overview
 
-## Challenge overview
+This walkthrough documents the UltraTech challenge, starting with service enumeration and web reconnaissance and ending with root access through Docker group membership.
 
-The challenge exposes FTP, SSH, and two web services. The path to root involves web-service enumeration, discovery of a vulnerable API behavior, local credential discovery, SSH access as a low-privileged user, and an unsafe Docker privilege boundary.
+The attack chain involved:
 
-**Outcome:** root access was obtained in the lab. The supplied notes do not establish a separately verified flag value.
+- Enumerating FTP, SSH, and web services
+- Finding the web sitemap and reviewing the partner login page
+- Discovering an API endpoint referenced by the site’s JavaScript
+- Identifying unsafe command handling in the API
+- Finding password hashes in the application’s SQLite database
+- Testing recovered credentials against SSH
+- Using the `docker` group privilege boundary to obtain root in the lab
 
-> **Credential hygiene:** The source notes contain recovered account credentials and a fragment of a root SSH private key. Those values are not reproduced here. Treat any exposed credentials or key material as compromised and rotate them wherever applicable.
+> **Lab scope:** The commands and observations below relate to the authorized CTF environment described in the notes. Credentials and private-key contents have been omitted from this repository write-up.
 
-## 1. Initial scan and service enumeration
+---
 
-An initial TCP service/version scan identified three listening services:
+## 1. Initial Reconnaissance
 
-| Port | Service | Observation |
-| --- | --- | --- |
-| 21 | FTP | vsftpd 3.0.5 |
-| 22 | SSH | OpenSSH 8.2p1 on Ubuntu |
-| 8081 | HTTP | Node.js / Express API |
-| 31331 | HTTP | Apache-hosted site |
+### Port Scanning
 
-The scan reported the host as up and described the environment as Linux/Unix.
+I started by checking the target for open TCP services and identifying their versions:
 
-For an authorized lab, record service versions and investigate each exposed service independently. Keep the target value scoped to the lab assignment rather than copying a transient address into a reusable guide.
-
-```text
-Example workflow (replace the placeholder only in your authorized lab):
-nmap -sS -sV <authorized-lab-host>
+```bash
+nmap -sS -sV <target-ip>
 ```
 
-> **Image placeholder:** `[Insert screenshot of the initial service scan, with unrelated or sensitive details redacted.]`
-
-## 2. FTP check — anonymous access failed
-
-The FTP service was tested for anonymous access. The server requested a password and then rejected the login with `530 Login incorrect`.
-
-This was a dead end: anonymous FTP access was not available. No files were obtained through this attempt, so the investigation moved on to the web services.
-
-> **Image placeholder:** `[Insert screenshot of the rejected anonymous FTP login.]`
-
-## 3. Web enumeration
-
-Directory/content enumeration of the Apache site found `/robots.txt`. Its contents pointed to a sitemap at `/utech_sitemap.txt`. The sitemap listed `/`, `/index.html`, `/what.html`, and `/partners.html`.
-
-The `/partners.html` page appeared to contain a login form. A form-focused SQL injection check was attempted, but it did not identify an injectable parameter or return database contents. This was another dead end; the login form alone did not reveal a way forward.
-
-> **Image placeholder:** `[Insert redacted screenshots of robots.txt, the sitemap, and the partners page.]`
-
-## 4. JavaScript review and API behavior
-
-Further inspection of the site’s JavaScript revealed that the browser called an API on port `8081`, including a `/ping` route with an `ip` query parameter. A request to that route was observed in the browser’s network history.
-
-Testing in the authorized lab showed that the API handled the supplied value unsafely and allowed server-side command execution. The observed response included the API process identity (`www`) and basic host information. This established the initial foothold in the challenge.
-
-> **Finding:** User-controlled input reached a system command without safe argument handling. This is a command-injection vulnerability. Validate inputs against a strict allowlist and avoid invoking a shell; use safe process APIs with fixed arguments instead.
->
-> **Redaction note:** The original notes include a working command-injection request. Its payload and replayable request are intentionally omitted.
-
-> **Image placeholder:** `[Insert a screenshot showing the vulnerable request and a redacted response. Do not include reusable payloads, secrets, or unrelated host data.]`
-
-## 5. Local enumeration and database discovery
-
-With the API’s low-privileged execution context established, the challenge notes describe inspecting the application directory. It contained the Node.js application, its startup script, dependencies, and a SQLite database named `utech.db.sqlite`.
-
-A first-pass text/string inspection of the SQLite file exposed schema-related text and account records. This was useful for identifying the database’s purpose, but string output is not a reliable substitute for properly parsing a database. The notes do not record a `binwalk` attempt or a separate decoding failure, so those steps are not invented here.
-
-The discovered account values were MD5 password hashes. An offline lookup/cracking attempt recovered credentials for two accounts. The recovered secrets are deliberately not reproduced in this write-up.
-
-> **Important:** Unsalted MD5 is unsuitable for password storage. Use a modern password-hashing scheme such as Argon2id, scrypt, or bcrypt, with unique salts and appropriate parameters.
-
-> **Image placeholder:** `[Insert a redacted view of the database schema and findings. Remove usernames if required by your disclosure policy, and always remove hashes and plaintext passwords.]`
-
-## 6. SSH access — one login failed, another succeeded
-
-The recovered credentials were tested against SSH. The first attempted account, `admin`, was denied access. That failed login showed that a valid web/database credential did not necessarily correspond to an SSH-enabled account.
-
-A second account from the database, `r00t`, did permit SSH access in the lab. The resulting shell was not root, but account and group enumeration showed membership in the `docker` group.
-
-> **Image placeholder:** `[Insert a screenshot of the failed admin SSH attempt and the successful low-privilege session, with passwords and identifying details removed.]`
-
-## 7. Privilege escalation through Docker access
-
-The user’s Docker group membership was the key privilege-escalation clue. The host had a local `bash` image. In this challenge configuration, Docker access allowed a container to be started with the host filesystem exposed, and the container ran with root privileges. This crossed the host/container privilege boundary and provided access to root-owned files.
-
-> **Finding:** Membership in the Docker group is effectively privileged on many host configurations. Treat Docker socket access and equivalent group membership as root-level access. Restrict membership, protect the daemon socket, and use rootless/container isolation options where appropriate.
->
-> **Redaction note:** The host-mount command from the notes is intentionally not reproduced because it is a directly reusable privilege-escalation instruction.
-
-> **Image placeholder:** `[Insert a redacted screenshot showing the privilege boundary and proof of root in the isolated lab. Do not include private-key contents.]`
-
-## 8. Root SSH key and final evidence
-
-After reaching root in the lab, the notes report locating the root user’s `.ssh` directory and reading `id_rsa`. The transcript only provides a short fragment of the private key and does not provide a complete, independently verifiable key or flag value.
-
-Private SSH keys must never be published. If key material has been exposed, consider it compromised, replace it, and remove it from repository history as well as the current file.
-
-## 9. Troubleshooting and dead ends (kept for completeness)
-
-| Attempt | Result | What it established |
-| --- | --- | --- |
-| Anonymous FTP login | Rejected with `530 Login incorrect` | Anonymous access was unavailable. |
-| SQL injection testing of the partners login form | No injection was identified | The login form was not the route used in this walkthrough. |
-| SSH login as `admin` | Permission denied | The database credential did not grant SSH access for this account. |
-| First-pass SQLite string inspection | Revealed schema and record text, but not a structured database view | Useful for discovery; use a proper SQLite reader in a controlled environment for reliable analysis. |
-| `binwalk` or separate decoding attempts | Not present in the supplied notes | No outcome can be stated without evidence. |
-
-## 10. Remediation summary
-
-1. Replace shell-based command execution with safe APIs and strict input validation.
-2. Restrict or remove access to the vulnerable API route; authenticate and authorize sensitive operations.
-3. Rotate any credentials that were stored in the database or exposed during testing.
-4. Replace unsalted MD5 password hashes with a dedicated modern password-hashing algorithm.
-5. Limit SSH access to explicitly authorized accounts and use key-based authentication where suitable.
-6. Remove unnecessary users from the Docker group and secure the Docker daemon/socket.
-7. Protect private keys with restrictive permissions, rotate exposed keys, and prevent secrets from entering source control.
-
-## Summary of the attack path
+### Results
 
 ```text
-Service discovery
-  → web content enumeration
-  → JavaScript reveals API route
-  → unsafe API input handling yields a low-privilege foothold
-  → local application/database discovery
-  → credential reuse testing (first SSH login fails; second succeeds)
-  → Docker group membership enables root access in the lab
+Nmap scan report for <target-ip>
+Host is up (0.23s latency).
+Not shown: 997 closed tcp ports (reset)
+
+PORT      STATE SERVICE VERSION
+21/tcp    open  ftp     vsftpd 3.0.5
+22/tcp    open  ssh     OpenSSH 8.2p1 Ubuntu 4ubuntu0.13
+8081/tcp  open  http    Node.js Express framework
+31331/tcp open  http    Apache
 ```
 
-**End state:** root access was achieved in the challenge environment. Sensitive credentials and private-key material have been excluded from this document.
+The services exposed two likely web entry points, along with FTP and SSH. I focused first on the Apache site on port `31331`.
+
+![Image Placeholder: Nmap scan output](./assets/nmap-scan.png)
+
+---
+
+## 2. FTP Enumeration
+
+I checked whether FTP allowed anonymous access:
+
+```text
+ftp <target-ip>
+Name: anonymous
+Password:
+530 Login incorrect.
+ftp: Login failed
+```
+
+Anonymous access was rejected, so FTP did not provide an initial foothold. I moved on to the web server.
+
+![Image Placeholder: Anonymous FTP login failure](./assets/ftp-anonymous-failure.png)
+
+---
+
+## 3. Web Enumeration
+
+### Directory Discovery
+
+I used Feroxbuster to look for common files and directories on the Apache site:
+
+```bash
+feroxbuster -u http://<target-ip>:31331/ \
+  -w /usr/share/wordlists/dirb/common.txt \
+  -x txt,php,html
+```
+
+The scan found `/robots.txt`:
+
+```text
+200 GET http://<target-ip>:31331/robots.txt
+```
+
+### `robots.txt` and Sitemap
+
+The file contained:
+
+```text
+Allow: *
+User-Agent: *
+Sitemap: /utech_sitemap.txt
+```
+
+I opened the sitemap and found these paths:
+
+```text
+/
+/index.html
+/what.html
+/partners.html
+```
+
+The `/partners.html` page contained a login form.
+
+![Image Placeholder: robots.txt and sitemap](./assets/robots-sitemap.png)
+
+### Failed SQL Injection Test
+
+I tested the login page for SQL injection using SQLmap:
+
+```bash
+sqlmap -u 'http://<target-ip>:31331/partners.html' --forms --batch --dump
+```
+
+This did not identify a usable SQL injection or return database contents. The login form was a dead end, so I continued enumerating the site’s client-side files.
+
+![Image Placeholder: Partners login page](./assets/partners-login.png)
+
+---
+
+## 4. JavaScript Review and API Discovery
+
+The site’s JavaScript was located at `/js/api.js`. Its relevant logic showed that the browser called an API on port `8081` and sent the hostname to a `/ping` endpoint:
+
+```javascript
+(function() {
+    console.warn('Debugging ::');
+
+    function getAPIURL() {
+        return `${window.location.hostname}:8081`;
+    }
+
+    function checkAPIStatus() {
+        const req = new XMLHttpRequest();
+        try {
+            const url = `http://${getAPIURL()}/ping?ip=${window.location.hostname}`;
+            req.open('GET', url, true);
+            // Remaining status-handling code omitted.
+        } catch (e) {
+            // Error handling omitted.
+        }
+    }
+})();
+```
+
+I reviewed the browser’s HTTP history and confirmed a request to the API:
+
+```http
+GET /ping?ip=<target-host> HTTP/1.1
+Host: <target-host>:8081
+```
+
+### Unsafe API Input Handling
+
+In the authorized lab, testing the `ip` parameter showed that user-controlled input was passed to a system command without safe handling. The response exposed command output and confirmed execution in the API’s low-privileged `www` context.
+
+> **Finding:** This is command injection caused by invoking a system command with untrusted input. The specific working payload is omitted from this write-up. In a real application, avoid shell execution for user input and validate any required values against a strict allowlist.
+
+![Image Placeholder: Redacted API request and response](./assets/api-command-injection.png)
+
+---
+
+## 5. Application and Database Enumeration
+
+The API process ran from a Node.js application directory. Directory enumeration showed the application files and a SQLite database:
+
+```text
+index.js
+node_modules/
+package.json
+package-lock.json
+start.sh
+utech.db.sqlite
+```
+
+I used a basic string inspection of the SQLite file to identify its schema and contents. This was an initial discovery step rather than a structured database review. The schema showed a `users` table with login, password, and type fields:
+
+```sql
+CREATE TABLE users (
+    login Varchar,
+    password Varchar,
+    type Int
+)
+```
+
+The records contained password hashes. I identified them as MD5 hashes and used an offline lookup/cracking attempt to recover two passwords. The recovered usernames and passwords are not repeated here.
+
+> **Password storage note:** Unsalted MD5 is not suitable for password storage. Use a dedicated password-hashing algorithm such as Argon2id, scrypt, or bcrypt, with unique salts and appropriate work factors.
+
+![Image Placeholder: Redacted database schema and findings](./assets/sqlite-findings.png)
+
+---
+
+## 6. SSH Credential Testing
+
+I first tried the recovered `admin` account over SSH. Authentication failed:
+
+```text
+Permission denied
+```
+
+This was an important failed attempt: credentials found in the application database did not necessarily provide SSH access for every account.
+
+I then tested the other recovered account, `r00t`, and was able to log in. The account was not root. Initial identity and group enumeration showed membership in the `docker` group:
+
+```text
+uid=1001(r00t) gid=1001(r00t) groups=1001(r00t),116(docker)
+```
+
+![Image Placeholder: Failed admin login and successful SSH session](./assets/ssh-access.png)
+
+---
+
+## 7. Privilege Escalation Through Docker
+
+After logging in, I checked the available Docker images:
+
+```text
+REPOSITORY   TAG       IMAGE ID       CREATED       SIZE
+bash         latest    <image-id>      7 years ago   15.8MB
+```
+
+The significant finding was not the image itself, but the user’s Docker group membership. In this challenge configuration, Docker access allowed a container to access the host filesystem with root privileges, crossing the container/host privilege boundary.
+
+> **Privilege escalation finding:** Access to the Docker daemon is effectively root-equivalent on many systems. Restrict Docker group membership and protect access to the daemon socket. The exact host-mount invocation is omitted here.
+
+The root context was confirmed in the lab:
+
+```text
+uid=0(root) gid=0(root) groups=0(root),1(bin),2(daemon),3(sys),4(adm),6(disk),10(wheel),11(floppy),20(dialout),26(tape),27(video)
+```
+
+![Image Placeholder: Redacted proof of root in the lab](./assets/root-access.png)
+
+---
+
+## 8. Root Directory and SSH Key
+
+After obtaining root access, I inspected `/root`. The directory contained `private.txt`, a `.ssh` directory, and the root SSH key files:
+
+```text
+.ssh/
+  authorized_keys
+  id_rsa
+  id_rsa.pub
+```
+
+The challenge question asked for the first nine characters of the private key. The notes include a key fragment, but private-key material is intentionally not reproduced in this public write-up. Do not commit private keys or fragments to a repository; rotate any key that has been exposed.
+
+![Image Placeholder: Root directory listing with sensitive content redacted](./assets/root-directory.png)
+
+---
+
+## 9. Trial-and-Error Notes
+
+The following unsuccessful attempts and troubleshooting steps were part of the investigation:
+
+1. **Anonymous FTP:** The server rejected the anonymous login with `530 Login incorrect`; no FTP files were available.
+2. **SQL injection on the partners login form:** SQLmap did not find an injection or dump records. The database was discovered later through the API foothold, not through the login form.
+3. **SSH as `admin`:** Login was denied even though an account/hash had been found in the database. Testing another recovered account led to SSH access.
+4. **Database inspection:** `strings` provided a quick view of schema and record text, but it was not a complete or structured database analysis. A SQLite-aware tool would be the more reliable way to inspect a copy of the database.
+5. **Tool attempts not evidenced in the notes:** The supplied notes do not show a `binwalk` run or a separate decoding failure, so no result is attributed to either.
+
+---
+
+## 10. Attack Chain Summary
+
+1. Scanned the target and identified FTP, SSH, and two HTTP services.
+2. Tried anonymous FTP; authentication was rejected.
+3. Enumerated the Apache site and found `robots.txt` and the sitemap.
+4. Inspected `/partners.html`; SQLmap did not find SQL injection.
+5. Reviewed `/js/api.js` and discovered the API on port `8081`.
+6. Identified unsafe handling of the API’s `ip` parameter and obtained a low-privilege foothold in the lab.
+7. Inspected the application directory and found `utech.db.sqlite`.
+8. Recovered credentials from hashes; the `admin` SSH attempt failed, while SSH access as `r00t` succeeded.
+9. Found that `r00t` belonged to the Docker group and used the unsafe Docker privilege boundary to reach root.
+10. Located the root SSH key files; the key contents are omitted from this write-up.
+
+> **Final escalation path:** API command injection → application database credential discovery → SSH as `r00t` → Docker group access → root.
+
+---
+
+## 11. Key Takeaways
+
+- Inspect JavaScript and browser network history when a web application communicates with a separate API.
+- SQL injection testing may fail even when sensitive database information is accessible through a different weakness.
+- Treat credentials recovered from an application database as sensitive, and verify account scope only in an authorized environment.
+- Untrusted input must never be passed directly to a shell command.
+- Docker daemon access should be treated as highly privileged and restricted accordingly.
+- Never publish recovered passwords, password hashes, or private SSH key material.
+
+---
+
+## Useful Enumeration Commands
+
+The following commands cover the non-secret discovery steps documented above. Replace `<target-ip>` only with the address assigned to your authorized lab:
+
+```bash
+nmap -sS -sV <target-ip>
+feroxbuster -u http://<target-ip>:31331/ -w /usr/share/wordlists/dirb/common.txt -x txt,php,html
+curl http://<target-ip>:31331/robots.txt
+curl http://<target-ip>:31331/utech_sitemap.txt
+curl http://<target-ip>:31331/js/api.js
+sqlmap -u 'http://<target-ip>:31331/partners.html' --forms --batch --dump
+ssh admin@<target-ip>
+ssh r00t@<target-ip>
+```
+
+---
+
+![Image Placeholder: UltraTech challenge completion](./assets/final-result.png)
