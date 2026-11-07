@@ -14,7 +14,7 @@ The attack chain involved:
 - Testing recovered credentials against SSH
 - Using the `docker` group privilege boundary to obtain root in the lab
 
-> **Lab scope:** The commands and observations below relate to the authorized CTF environment described in the notes. Credentials and private-key contents have been omitted from this repository write-up.
+> **Lab scope:** This write-up describes the authorized CTF environment from the notes. Replayable command-injection requests, recovered passwords, and private-key contents are redacted.
 
 ---
 
@@ -153,11 +153,15 @@ GET /ping?ip=<target-host> HTTP/1.1
 Host: <target-host>:8081
 ```
 
-### Unsafe API Input Handling
+### Testing the API
 
-In the authorized lab, testing the `ip` parameter showed that user-controlled input was passed to a system command without safe handling. The response exposed command output and confirmed execution in the API’s low-privileged `www` context.
+In the authorized lab, I tested how the `/ping` endpoint handled the `ip` parameter. The notes show that an encoded line break followed by a basic command caused the API to return command output, confirming that the parameter was passed to a system command unsafely.
 
-> **Finding:** This is command injection caused by invoking a system command with untrusted input. The specific working payload is omitted from this write-up. In a real application, avoid shell execution for user input and validate any required values against a strict allowlist.
+> **Redaction note:** The original request included a command-injection separator and commands. The exact replayable request is omitted here; the observed steps were to check the process identity and list the application directory.
+
+The response identified the process as `www`. The directory listing showed the Node.js application, dependencies, startup script, and SQLite database. This confirmed a low-privileged foothold in the API’s execution context and provided the next lead: `utech.db.sqlite`.
+
+> **Finding:** User-controlled input reached a system command without safe argument handling. In a real application, avoid shell execution for user input and validate required values against a strict allowlist.
 
 ![Image Placeholder: Redacted API request and response](./assets/api-command-injection.png)
 
@@ -165,7 +169,7 @@ In the authorized lab, testing the `ip` parameter showed that user-controlled in
 
 ## 5. Application and Database Enumeration
 
-The API process ran from a Node.js application directory. Directory enumeration showed the application files and a SQLite database:
+The API process ran from a Node.js application directory. The listing obtained during the API testing showed:
 
 ```text
 index.js
@@ -176,21 +180,28 @@ start.sh
 utech.db.sqlite
 ```
 
-I used a basic string inspection of the SQLite file to identify its schema and contents. This was an initial discovery step rather than a structured database review. The schema showed a `users` table with login, password, and type fields:
+I then used `strings` against the SQLite file to get a quick view of its contents. In the lab, this was done through the same `/ping` API behavior. The exact command-injection request is omitted, but the inspected file was `utech.db.sqlite`.
 
-```sql
+The string output included the SQLite signature, a `users` table schema, and account records:
+
+```text
+SQLite format 3
 CREATE TABLE users (
     login Varchar,
     password Varchar,
     type Int
 )
+
+<account records and password hashes redacted>
 ```
 
-The records contained password hashes. I identified them as MD5 hashes and used an offline lookup/cracking attempt to recover two passwords. The recovered usernames and passwords are not repeated here.
+The hashes were identified as MD5. I used an online hash lookup for quick testing; John the Ripper is another option for authorized offline password recovery. Two account passwords were recovered, but the hashes and plaintext passwords are not repeated here.
 
 > **Password storage note:** Unsalted MD5 is not suitable for password storage. Use a dedicated password-hashing algorithm such as Argon2id, scrypt, or bcrypt, with unique salts and appropriate work factors.
 
-![Image Placeholder: Redacted database schema and findings](./assets/sqlite-findings.png)
+> **Troubleshooting:** `strings` was useful for quickly spotting the schema and records, but it is not a structured way to query a database. A SQLite-aware tool would be more reliable for inspecting a local copy.
+
+![Image Placeholder: Redacted SQLite string output](./assets/sqlite-findings.png)
 
 ---
 
@@ -239,16 +250,29 @@ uid=0(root) gid=0(root) groups=0(root),1(bin),2(daemon),3(sys),4(adm),6(disk),10
 
 ## 8. Root Directory and SSH Key
 
-After obtaining root access, I inspected `/root`. The directory contained `private.txt`, a `.ssh` directory, and the root SSH key files:
+After obtaining root access, I navigated to the mounted root user’s home directory and listed its contents:
 
 ```text
-.ssh/
-  authorized_keys
-  id_rsa
-  id_rsa.pub
+cd /mnt/root/root/
+ls
+private.txt  snap
 ```
 
-The challenge question asked for the first nine characters of the private key. The notes include a key fragment, but private-key material is intentionally not reproduced in this public write-up. Do not commit private keys or fragments to a repository; rotate any key that has been exposed.
+I then checked the directory, including hidden files:
+
+```text
+ls -la
+```
+
+The listing included a `.ssh` directory. Inside it, I found the root SSH key files:
+
+```text
+authorized_keys
+id_rsa
+id_rsa.pub
+```
+
+The challenge question asked for the first nine characters of the private key. The notes include a key fragment, but private-key material is intentionally not reproduced in this repository. Do not commit private keys or fragments; rotate any key that has been exposed.
 
 ![Image Placeholder: Root directory listing with sensitive content redacted](./assets/root-directory.png)
 
@@ -261,7 +285,7 @@ The following unsuccessful attempts and troubleshooting steps were part of the i
 1. **Anonymous FTP:** The server rejected the anonymous login with `530 Login incorrect`; no FTP files were available.
 2. **SQL injection on the partners login form:** SQLmap did not find an injection or dump records. The database was discovered later through the API foothold, not through the login form.
 3. **SSH as `admin`:** Login was denied even though an account/hash had been found in the database. Testing another recovered account led to SSH access.
-4. **Database inspection:** `strings` provided a quick view of schema and record text, but it was not a complete or structured database analysis. A SQLite-aware tool would be the more reliable way to inspect a copy of the database.
+4. **Database inspection:** `strings` provided a quick view of schema and record text, but it was not a complete or structured database analysis. A SQLite-aware tool would be a more reliable way to query the database.
 5. **Tool attempts not evidenced in the notes:** The supplied notes do not show a `binwalk` run or a separate decoding failure, so no result is attributed to either.
 
 ---
@@ -273,13 +297,14 @@ The following unsuccessful attempts and troubleshooting steps were part of the i
 3. Enumerated the Apache site and found `robots.txt` and the sitemap.
 4. Inspected `/partners.html`; SQLmap did not find SQL injection.
 5. Reviewed `/js/api.js` and discovered the API on port `8081`.
-6. Identified unsafe handling of the API’s `ip` parameter and obtained a low-privilege foothold in the lab.
-7. Inspected the application directory and found `utech.db.sqlite`.
-8. Recovered credentials from hashes; the `admin` SSH attempt failed, while SSH access as `r00t` succeeded.
-9. Found that `r00t` belonged to the Docker group and used the unsafe Docker privilege boundary to reach root.
-10. Located the root SSH key files; the key contents are omitted from this write-up.
+6. Tested the API’s `ip` parameter and confirmed unsafe command handling.
+7. Listed the application directory and found `utech.db.sqlite`.
+8. Used `strings` to identify the SQLite schema and MD5 password hashes; recovered credentials were tested against SSH.
+9. The SSH login as `admin` failed; SSH access as `r00t` succeeded.
+10. Found that `r00t` belonged to the Docker group and used the unsafe Docker privilege boundary to reach root.
+11. Navigated to `/mnt/root/root/` and located the root SSH key files; key contents are omitted.
 
-> **Final escalation path:** API command injection → application database credential discovery → SSH as `r00t` → Docker group access → root.
+> **Final escalation path:** API command injection → application/database discovery → SSH as `r00t` → Docker group access → root.
 
 ---
 
@@ -287,8 +312,8 @@ The following unsuccessful attempts and troubleshooting steps were part of the i
 
 - Inspect JavaScript and browser network history when a web application communicates with a separate API.
 - SQL injection testing may fail even when sensitive database information is accessible through a different weakness.
-- Treat credentials recovered from an application database as sensitive, and verify account scope only in an authorized environment.
 - Untrusted input must never be passed directly to a shell command.
+- Unsalted MD5 hashes can be recovered quickly and should not be used for passwords.
 - Docker daemon access should be treated as highly privileged and restricted accordingly.
 - Never publish recovered passwords, password hashes, or private SSH key material.
 
